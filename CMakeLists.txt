@@ -66,13 +66,39 @@ if(INSTALL_AVB_SIGN)
     endif()
 endif()
 
-enable_testing()
-add_test(NAME integration COMMAND ${CMAKE_SOURCE_DIR}/avb_verify_test.sh
-         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-set_tests_properties(integration PROPERTIES
-    ENVIRONMENT "avb_verify=$<TARGET_FILE:avb_verify>")
+include(CTest)
+if(BUILD_TESTING)
+    add_test(NAME integration COMMAND ${CMAKE_SOURCE_DIR}/avb_verify_test.sh
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(integration PROPERTIES
+        ENVIRONMENT "avb_verify=$<TARGET_FILE:avb_verify>")
 
-add_test(NAME avb_sign COMMAND ${CMAKE_SOURCE_DIR}/avb_sign_test.sh
-         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-set_tests_properties(avb_sign PROPERTIES
-    ENVIRONMENT "avb_verify=$<TARGET_FILE:avb_verify>")
+    add_test(NAME avb_sign COMMAND ${CMAKE_SOURCE_DIR}/avb_sign_test.sh
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(avb_sign PROPERTIES
+        ENVIRONMENT "avb_verify=$<TARGET_FILE:avb_verify>")
+
+    # Small internal tests share the verifier's exact libavb configuration.
+    get_target_property(VERIFY_SOURCES avb_verify SOURCES)
+    list(REMOVE_ITEM VERIFY_SOURCES avb_verify.c)
+    add_executable(avb_verify_unit tests/verify_unit.c ${VERIFY_SOURCES})
+    foreach(prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS LINK_LIBRARIES)
+        get_target_property(value avb_verify ${prop})
+        if(value)
+            set_property(TARGET avb_verify_unit PROPERTY ${prop} ${value})
+        endif()
+    endforeach()
+    target_compile_options(avb_verify_unit PRIVATE -Wall -Wextra)
+    add_test(NAME verify_unit COMMAND avb_verify_unit)
+
+    find_program(PYTHON3_EXECUTABLE NAMES python3)
+    if(NOT PYTHON3_EXECUTABLE)
+        message(FATAL_ERROR "Python 3 is required for tests; use -DBUILD_TESTING=OFF for target-only builds")
+    endif()
+    add_test(NAME large_images COMMAND ${PYTHON3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/large_images.py)
+    set_tests_properties(large_images PROPERTIES
+        ENVIRONMENT "AVB_VERIFY=$<TARGET_FILE:avb_verify>"
+        TIMEOUT 300)
+    add_test(NAME build32 COMMAND sh ${CMAKE_SOURCE_DIR}/tests/build32.sh)
+    set_tests_properties(build32 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+endif()

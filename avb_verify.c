@@ -7,7 +7,7 @@
  *
  * Reads an image file or block device, locates the AVB footer (scanning
  * forward in 1 MiB chunks when it is not at the last block), verifies
- * the vbmeta PKCS#7 signature, and checks the embedded public key against
+ * the vbmeta signature, and checks the embedded public key against
  * a trusted reference key.
  *
  * Output modes:
@@ -28,7 +28,18 @@
  *   avbtool extract_public_key --key key.pem --output pubkey.bin
  */
 
+/* Required even when built outside CMake, before any system headers. */
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#elif _FILE_OFFSET_BITS != 64
+#error "avb_verify requires _FILE_OFFSET_BITS=64"
+#endif
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <errno.h>
+#include <inttypes.h>
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,10 +48,15 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
 #include <linux/keyctl.h>
 #include <linux/magic.h>
 
 #include <libavb/libavb.h>
+
+_Static_assert(sizeof(off_t) >= 8, "64-bit file offsets required");
 
 #define FAIL(...) \
 	do { fprintf(stderr, __VA_ARGS__); ret = 1; goto out; } while (0)
@@ -52,11 +68,14 @@
 #define SCAN_CHUNK_SIZE		(1024 * 1024)
 
 /*
- * Maximum number of blocks to scan when searching for the AVB footer.
- * Covers block devices up to 2048 MiB larger than the actual signed
- * image.  Increase if needed.
+ * Bytes searched from the filesystem hint (including 1 MiB look-behind).
+ * If that misses, search the first 2 GiB, without rescanning any overlap.
+ * This bounds I/O, not device size or the amount of trailing padding.
  */
-#define FOOTER_SCAN_MAX_BLOCKS	((2048ULL * 1024 * 1024) / AVB_BLOCK_SIZE)
+#define FOOTER_SCAN_BUDGET	(2ULL * 1024 * 1024 * 1024)
+/* Same vbmeta bound as libavb's slot verifier; also bounds untrusted allocation. */
+#define VBMETA_MAX_SIZE		(64 * 1024)
+#define PUBLIC_KEY_MAX_SIZE	(64 * 1024)
 
 #define ROOTHASH_SIG_KEY_PREFIX	"avb_roothash_sig."
 #define AVB_PART_NAME_MAX_LEN	128
@@ -64,6 +83,7 @@
 /* Hashtree descriptor fields extracted from vbmeta */
 typedef struct {
 	bool found;
+	bool invalid;
 	AvbHashtreeDescriptor ht;
 	const uint8_t *partition_name;
 	const uint8_t *salt;
@@ -87,40 +107,136 @@ static uint64_t read_le64(const uint8_t *p)
 	return (uint64_t)read_le32(p) | ((uint64_t)read_le32(p + 4) << 32);
 }
 
-/*
- * Detect filesystem size from superblock (ext2/ext3/ext4, erofs or squashfs).
- * Returns the filesystem size in bytes, or 0 if unknown.
- */
-static uint64_t detect_fs_size(FILE *fp)
+/* All conversions to off_t go through this checked, 64-bit path. */
+static bool read_at(FILE *fp, uint64_t offset, void *buf, size_t len)
 {
-	uint8_t sb[4096];
-
-	fseek(fp, 0, SEEK_SET);
-	if (fread(sb, 1, sizeof(sb), fp) < 2048)
-		return 0;
-
-	/* ext2/ext3/ext4: superblock at offset 1024, magic at sb+56 */
-	if (read_le16(sb + 1024 + 56) == EXT4_SUPER_MAGIC) {
-		uint32_t s_blocks_count_lo = read_le32(sb + 1024 + 4);
-		uint32_t s_log_block_size  = read_le32(sb + 1024 + 24);
-		uint64_t block_size        = 1024ULL << s_log_block_size;
-
-		return (uint64_t)s_blocks_count_lo * block_size;
+	if (offset > INT64_MAX) {
+		errno = EOVERFLOW;
+		return false;
 	}
-
-	/* erofs: superblock at offset 1024 */
-	if (read_le32(sb + 1024) == EROFS_SUPER_MAGIC_V1) {
-		uint8_t  blkszbits = sb[1024 + 12];
-		uint32_t blocks    = read_le32(sb + 1024 + 36);
-
-		return (uint64_t)blocks << blkszbits;
+	if (fseeko(fp, (off_t)offset, SEEK_SET) != 0)
+		return false;
+	if (fread(buf, 1, len, fp) != len) {
+		if (!ferror(fp))
+			errno = EIO;
+		return false;
 	}
+	return true;
+}
 
-	/* squashfs: magic at offset 0, bytes_used at offset 40 */
-	if (read_le32(sb) == SQUASHFS_MAGIC)
-		return read_le64(sb + 40);
+static bool get_image_size(FILE *fp, uint64_t *size)
+{
+	struct stat st;
 
-	return 0;
+	if (fstat(fileno(fp), &st) != 0)
+		return false;
+	if (S_ISREG(st.st_mode)) {
+		if (st.st_size < 0) {
+			errno = EOVERFLOW;
+			return false;
+		}
+		*size = (uint64_t)st.st_size;
+	} else if (S_ISBLK(st.st_mode)) {
+		if (ioctl(fileno(fp), BLKGETSIZE64, size) != 0)
+			return false;
+	} else {
+		errno = EINVAL;
+		return false;
+	}
+	if (*size > INT64_MAX) {
+		errno = EOVERFLOW;
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Unauthenticated search hints, never verification evidence. Reject impossible
+ * sizes before shifting/multiplying. Unsupported formats use the prefix scan.
+ */
+static uint64_t detect_fs_size(const uint8_t *sb, size_t len, uint64_t image_size)
+{
+	uint64_t size = 0, blocks;
+	uint32_t shift;
+
+	if (len >= 2048 && read_le16(sb + 1024 + 56) == EXT4_SUPER_MAGIC) {
+		shift = read_le32(sb + 1024 + 24);
+		if (shift > 6) /* ext block sizes: 1 KiB through 64 KiB */
+			return 0;
+		blocks = read_le32(sb + 1024 + 4);
+		if (read_le32(sb + 1024 + 96) & 0x80) /* INCOMPAT_64BIT */
+			blocks |= (uint64_t)read_le32(sb + 1024 + 336) << 32;
+		shift += 10;
+		if (blocks > (UINT64_MAX >> shift))
+			return 0;
+		size = blocks << shift;
+	} else if (len >= 1152 && read_le32(sb + 1024) == EROFS_SUPER_MAGIC_V1) {
+		shift = sb[1024 + 12];
+		if (shift < 9 || shift > 16)
+			return 0;
+		blocks = read_le32(sb + 1024 + 36);
+		if (read_le32(sb + 1024 + 80) & 0x80) /* INCOMPAT_48BIT */
+			blocks |= (uint64_t)read_le16(sb + 1024 + 14) << 32;
+		if (blocks > (UINT64_MAX >> shift))
+			return 0;
+		size = blocks << shift;
+	} else if (len >= 96 && read_le32(sb) == SQUASHFS_MAGIC) {
+		shift = read_le16(sb + 22);
+		if (read_le16(sb + 28) != 4 || read_le16(sb + 30) != 0 ||
+		    shift < 12 || shift > 20 || read_le32(sb + 12) != (1U << shift))
+			return 0;
+		size = read_le64(sb + 40);
+		if (size < 96)
+			return 0;
+		return size <= image_size ? size : 0;
+	}
+	return size >= 2048 && size <= image_size ? size : 0;
+}
+
+/* The footer itself is not signed. Bound every field before allocating/seeking. */
+static bool decode_footer(const AvbFooter *raw, uint64_t offset, AvbFooter *footer)
+{
+	if (memcmp(raw->magic, AVB_FOOTER_MAGIC, AVB_FOOTER_MAGIC_LEN) != 0 ||
+	    !avb_footer_validate_and_byteswap(raw, footer))
+		return false;
+	return footer->original_image_size <= footer->vbmeta_offset &&
+	       footer->vbmeta_offset <= offset &&
+	       footer->vbmeta_size >= sizeof(AvbVBMetaImageHeader) &&
+	       footer->vbmeta_size <= VBMETA_MAX_SIZE &&
+	       footer->vbmeta_size <= SIZE_MAX &&
+	       footer->vbmeta_size <= offset - footer->vbmeta_offset;
+}
+
+/* Scan complete 4 KiB blocks in [start, end); end may be unaligned. */
+static int scan_footer(FILE *fp, uint64_t start, uint64_t end, AvbFooter *footer)
+{
+	uint8_t *chunk = malloc(SCAN_CHUNK_SIZE);
+	int result = 0;
+
+	if (!chunk)
+		return -1;
+	end -= end % AVB_BLOCK_SIZE;
+	for (uint64_t pos = start; pos < end;) {
+		size_t len = end - pos > SCAN_CHUNK_SIZE ?
+			SCAN_CHUNK_SIZE : (size_t)(end - pos);
+		if (!read_at(fp, pos, chunk, len)) {
+			result = -1;
+			break;
+		}
+		for (size_t off = AVB_BLOCK_SIZE - AVB_FOOTER_SIZE;
+		     off < len; off += AVB_BLOCK_SIZE) {
+			AvbFooter raw;
+			memcpy(&raw, chunk + off, sizeof(raw));
+			if (decode_footer(&raw, pos + off, footer)) {
+				result = 1;
+				goto out;
+			}
+		}
+		pos += len;
+	}
+out:
+	free(chunk);
+	return result;
 }
 
 static void print_hex(const uint8_t *data, size_t len)
@@ -131,35 +247,29 @@ static void print_hex(const uint8_t *data, size_t len)
 
 static uint8_t *read_file_all(const char *path, size_t *out_size)
 {
-	uint8_t *buf;
-	FILE *fp;
-	long len;
+	uint8_t *buf = NULL;
+	FILE *fp = fopen(path, "rb");
+	uint64_t len;
 
-	fp = fopen(path, "rb");
 	if (!fp) {
-		fprintf(stderr, "Error: cannot open '%s': %s\n",
-			path, strerror(errno));
+		fprintf(stderr, "Error: cannot open '%s': %s\n", path, strerror(errno));
 		return NULL;
 	}
-	fseek(fp, 0, SEEK_END);
-	len = ftell(fp);
-	if (len < 0) {
-		fclose(fp);
-		return NULL;
+	if (!get_image_size(fp, &len) || len == 0 || len > PUBLIC_KEY_MAX_SIZE ||
+	    len > SIZE_MAX) {
+		fprintf(stderr, "Error: invalid public key file size.\n");
+		goto out;
 	}
-	rewind(fp);
 	buf = malloc((size_t)len);
-	if (!buf) {
-		fclose(fp);
-		return NULL;
-	}
-	if (fread(buf, 1, (size_t)len, fp) != (size_t)len) {
+	if (!buf || !read_at(fp, 0, buf, (size_t)len)) {
+		fprintf(stderr, "Error: could not read public key: %s\n", strerror(errno));
 		free(buf);
-		fclose(fp);
-		return NULL;
+		buf = NULL;
+		goto out;
 	}
-	fclose(fp);
 	*out_size = (size_t)len;
+out:
+	fclose(fp);
 	return buf;
 }
 
@@ -178,26 +288,69 @@ static const char *algorithm_name(uint32_t type)
 	}
 }
 
-/* Descriptor callback to find the first hashtree descriptor. */
+/* Require one unambiguous hashtree descriptor and validate the full array. */
 static bool find_hashtree(const AvbDescriptor *desc, void *user_data)
 {
 	HashtreeInfo *info = (HashtreeInfo *)user_data;
 	AvbDescriptor header;
 	const uint8_t *p;
 
-	if (!avb_descriptor_validate_and_byteswap(desc, &header))
-		return true;
+	if (!avb_descriptor_validate_and_byteswap(desc, &header)) {
+		info->invalid = true;
+		return false;
+	}
 	if (header.tag != AVB_DESCRIPTOR_TAG_HASHTREE)
 		return true;
-	if (!avb_hashtree_descriptor_validate_and_byteswap(
-			(const AvbHashtreeDescriptor *)desc, &info->ht))
-		return true;
+	/* libavb's typed validator copies the fixed structure before checking size. */
+	if (info->found || header.num_bytes_following <
+	    sizeof(AvbHashtreeDescriptor) - sizeof(AvbDescriptor) ||
+	    !avb_hashtree_descriptor_validate_and_byteswap(
+			(const AvbHashtreeDescriptor *)desc, &info->ht)) {
+		info->invalid = true;
+		return false;
+	}
 	p = (const uint8_t *)desc + sizeof(AvbHashtreeDescriptor);
 	info->partition_name = p;
 	info->salt           = p + info->ht.partition_name_len;
 	info->root_digest    = info->salt + info->ht.salt_len;
 	info->found          = true;
-	return false;
+	return true;
+}
+
+static bool valid_block_size(uint32_t size)
+{
+	return size >= 512 && size <= 65536 && (size & (size - 1)) == 0;
+}
+
+/* Validate signed values too: do not divide by zero or silently round a table. */
+static bool valid_hashtree(const HashtreeInfo *info, uint64_t vbmeta_offset)
+{
+	const AvbHashtreeDescriptor *ht = &info->ht;
+	const char *alg = (const char *)ht->hash_algorithm;
+
+	if (!valid_block_size(ht->data_block_size) || !valid_block_size(ht->hash_block_size) ||
+	    ht->dm_verity_version > 1 || ht->image_size == 0 ||
+	    ht->image_size % ht->data_block_size != 0 ||
+	    ht->tree_offset % ht->hash_block_size != 0 ||
+	    ht->tree_size % ht->hash_block_size != 0 ||
+	    ht->image_size > ht->tree_offset || ht->tree_offset > vbmeta_offset ||
+	    ht->tree_size > vbmeta_offset - ht->tree_offset ||
+	    ht->partition_name_len > AVB_PART_NAME_MAX_LEN ||
+	    !memchr(alg, '\0', sizeof(ht->hash_algorithm)))
+		return false;
+	if (!((strcmp(alg, "sha1") == 0 && ht->root_digest_len == 20) ||
+	      (strcmp(alg, "sha256") == 0 && ht->root_digest_len == 32) ||
+	      (strcmp(alg, "blake2b-256") == 0 && ht->root_digest_len == 32) ||
+	      (strcmp(alg, "sha512") == 0 && ht->root_digest_len == 64)))
+		return false;
+	/* Names are also used as a single token in the key description. */
+	for (uint32_t i = 0; i < ht->partition_name_len; i++) {
+		uint8_t c = info->partition_name[i];
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		      (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'))
+			return false;
+	}
+	return true;
 }
 
 /*
@@ -239,13 +392,13 @@ static int load_roothash_sig(const uint8_t *vbmeta, size_t vbmeta_size,
 }
 
 static void print_verity_table(const char *prefix, const char *device_path,
-				unsigned long sectors, const HashtreeInfo *ht,
-				unsigned long data_blocks,
-				unsigned long hash_start,
+				uint64_t sectors, const HashtreeInfo *ht,
+				uint64_t data_blocks,
+				uint64_t hash_start,
 				bool has_roothash_sig,
 				const char *sig_key_desc)
 {
-	printf("%s0 %lu verity %u %s %s %u %u %lu %lu %s ",
+	printf("%s0 %" PRIu64 " verity %u %s %s %u %u %" PRIu64 " %" PRIu64 " %s ",
 	       prefix, sectors, ht->ht.dm_verity_version,
 	       device_path, device_path,
 	       ht->ht.data_block_size, ht->ht.hash_block_size,
@@ -253,7 +406,10 @@ static void print_verity_table(const char *prefix, const char *device_path,
 	       (const char *)ht->ht.hash_algorithm);
 	print_hex(ht->root_digest, ht->ht.root_digest_len);
 	printf(" ");
-	print_hex(ht->salt, ht->ht.salt_len);
+	if (ht->ht.salt_len)
+		print_hex(ht->salt, ht->ht.salt_len);
+	else
+		printf("-");
 	if (has_roothash_sig)
 		printf(" 2 root_hash_sig_key_desc %s", sig_key_desc);
 	printf("\n");
@@ -313,9 +469,9 @@ int main(int argc, char *argv[])
 	char sig_key_desc[AVB_PART_NAME_MAX_LEN + sizeof(ROOTHASH_SIG_KEY_PREFIX)];
 	int sig_rc;
 	bool has_roothash_sig;
-	unsigned long data_blocks;
-	unsigned long sectors;
-	unsigned long hash_start;
+	uint64_t data_blocks;
+	uint64_t sectors;
+	uint64_t hash_start;
 
 	memset(sig_key_desc, 0, sizeof(sig_key_desc));
 
@@ -353,68 +509,42 @@ int main(int argc, char *argv[])
 		FAIL("Error: cannot open '%s': %s\n",
 		     device_path, strerror(errno));
 
-	fseek(fp, 0, SEEK_END);
-	image_size = (uint64_t)ftell(fp);
+	if (!get_image_size(fp, &image_size))
+		FAIL("Error: cannot determine image size: %s\n", strerror(errno));
 	if (image_size < AVB_FOOTER_SIZE)
 		FAIL("Error: image too small for AVB footer.\n");
 
 	clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
-	/* Fast path: footer at end of file/device */
-	fseek(fp, (long)(image_size - AVB_FOOTER_SIZE), SEEK_SET);
-	if (fread(&raw_footer, 1, AVB_FOOTER_SIZE, fp) == AVB_FOOTER_SIZE &&
-	    memcmp(raw_footer.magic, AVB_FOOTER_MAGIC, AVB_FOOTER_MAGIC_LEN) == 0 &&
-	    avb_footer_validate_and_byteswap(&raw_footer, &footer))
-		footer_found = true;
+	/* The exact end is always tried, even for an unaligned container. */
+	if (!read_at(fp, image_size - AVB_FOOTER_SIZE, &raw_footer, sizeof(raw_footer)))
+		FAIL("Error: could not read footer: %s\n", strerror(errno));
+	footer_found = decode_footer(&raw_footer, image_size - AVB_FOOTER_SIZE, &footer);
 
-	/* Slow path: scan forward in 1 MiB chunks */
 	if (!footer_found) {
-		uint64_t max_scan  = FOOTER_SCAN_MAX_BLOCKS * (uint64_t)AVB_BLOCK_SIZE;
-		uint64_t scan_end  = (image_size < max_scan) ? image_size : max_scan;
-		uint64_t fs_size   = detect_fs_size(fp);
-		uint64_t scan_start = 0;
-		uint8_t *chunk;
+		uint8_t sb[4096];
+		size_t sb_len = image_size < sizeof(sb) ? (size_t)image_size : sizeof(sb);
+		uint64_t scan_start = 0, scan_end, fs_size;
+		int scan_result;
 
+		if (!read_at(fp, 0, sb, sb_len))
+			FAIL("Error: could not read superblock: %s\n", strerror(errno));
+		fs_size = detect_fs_size(sb, sb_len, image_size);
 		if (fs_size > SCAN_CHUNK_SIZE)
 			scan_start = (fs_size - SCAN_CHUNK_SIZE) &
 				     ~(uint64_t)(AVB_BLOCK_SIZE - 1);
 
-		chunk = malloc(SCAN_CHUNK_SIZE);
-		if (!chunk)
-			FAIL("Error: out of memory.\n");
-
-		for (uint64_t pos = scan_start;
-		     pos < scan_end && !footer_found; ) {
-			uint64_t chunk_len = scan_end - pos;
-			size_t got;
-
-			if (chunk_len > SCAN_CHUNK_SIZE)
-				chunk_len = SCAN_CHUNK_SIZE;
-
-			fseek(fp, (long)pos, SEEK_SET);
-			got = fread(chunk, 1, (size_t)chunk_len, fp);
-			if (got < AVB_BLOCK_SIZE)
-				break;
-
-			/* Check each 4 KiB footer position within this chunk */
-			uint64_t last_off = (got / AVB_BLOCK_SIZE) *
-					    AVB_BLOCK_SIZE - AVB_FOOTER_SIZE;
-
-			for (uint64_t off = AVB_BLOCK_SIZE - AVB_FOOTER_SIZE;
-			     off <= last_off; off += AVB_BLOCK_SIZE) {
-				if (memcmp(chunk + off, AVB_FOOTER_MAGIC,
-					   AVB_FOOTER_MAGIC_LEN) != 0)
-					continue;
-				memcpy(&raw_footer, chunk + off, AVB_FOOTER_SIZE);
-				if (avb_footer_validate_and_byteswap(&raw_footer,
-								     &footer)) {
-					footer_found = true;
-					break;
-				}
-			}
-			pos += got;
-		}
-		free(chunk);
+		/* Subtract first: no overflow in scan_start + budget. */
+		scan_end = scan_start + ((image_size - scan_start < FOOTER_SCAN_BUDGET) ?
+			(image_size - scan_start) : FOOTER_SCAN_BUDGET);
+		scan_result = scan_footer(fp, scan_start, scan_end, &footer);
+		if (scan_result == 0 && scan_start != 0)
+			scan_result = scan_footer(fp, 0,
+				scan_start < FOOTER_SCAN_BUDGET ? scan_start : FOOTER_SCAN_BUDGET,
+				&footer);
+		if (scan_result < 0)
+			FAIL("Error: footer scan read failed: %s\n", strerror(errno));
+		footer_found = scan_result == 1;
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &ts_end);
@@ -424,14 +554,13 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Footer scan: %.3f ms\n", scan_ms);
 
 	if (!footer_found)
-		FAIL("Error: AVB footer not found.\n");
+		FAIL("Error: AVB footer not found (bounded scan; invalid footers ignored).\n");
 
 	/* Read VBMeta blob */
 	vbmeta = malloc((size_t)footer.vbmeta_size);
 	if (!vbmeta)
 		FAIL("Error: out of memory.\n");
-	fseek(fp, (long)footer.vbmeta_offset, SEEK_SET);
-	if (fread(vbmeta, 1, (size_t)footer.vbmeta_size, fp) != footer.vbmeta_size)
+	if (!read_at(fp, footer.vbmeta_offset, vbmeta, (size_t)footer.vbmeta_size))
 		FAIL("Error: could not read VBMeta.\n");
 	fclose(fp);
 	fp = NULL;
@@ -452,10 +581,13 @@ int main(int argc, char *argv[])
 	avb_vbmeta_image_header_to_host_byte_order(&raw_hdr, &hdr);
 
 	/* Find hashtree descriptor */
-	avb_descriptor_foreach(vbmeta, (size_t)footer.vbmeta_size,
-			       find_hashtree, &ht);
+	if (!avb_descriptor_foreach(vbmeta, (size_t)footer.vbmeta_size,
+				    find_hashtree, &ht) || ht.invalid)
+		FAIL("Error: invalid hashtree descriptors.\n");
 	if (!ht.found)
 		FAIL("No hashtree descriptor found.\n");
+	if (!valid_hashtree(&ht, footer.vbmeta_offset))
+		FAIL("Error: invalid dm-verity parameters.\n");
 
 	sig_rc = load_roothash_sig(vbmeta, (size_t)footer.vbmeta_size,
 				   &ht, !dm_table_only, no_keyring,
@@ -464,9 +596,9 @@ int main(int argc, char *argv[])
 		FAIL("Error: add_key to session keyring: %s\n", strerror(errno));
 	has_roothash_sig = (sig_rc > 0);
 
-	data_blocks = (unsigned long)(ht.ht.image_size / ht.ht.data_block_size);
-	sectors     = data_blocks * (ht.ht.data_block_size / 512);
-	hash_start  = (unsigned long)(ht.ht.tree_offset / ht.ht.hash_block_size);
+	data_blocks = ht.ht.image_size / ht.ht.data_block_size;
+	sectors     = ht.ht.image_size / 512;
+	hash_start  = ht.ht.tree_offset / ht.ht.hash_block_size;
 
 	if (dm_table_only) {
 		print_verity_table("", device_path, sectors, &ht,
@@ -477,14 +609,14 @@ int main(int argc, char *argv[])
 
 	printf("Verification:  OK\n");
 	printf("Algorithm:     %s\n", algorithm_name(hdr.algorithm_type));
-	printf("Rollback:      %lu\n", (unsigned long)hdr.rollback_index);
+	printf("Rollback:      %" PRIu64 "\n", hdr.rollback_index);
 	printf("Partition:     %.*s\n",
 	       (int)ht.ht.partition_name_len, ht.partition_name);
 	printf("Hash alg:      %s\n", ht.ht.hash_algorithm);
-	printf("Data blocks:   %lu\n", data_blocks);
+	printf("Data blocks:   %" PRIu64 "\n", data_blocks);
 	printf("Data block sz: %u\n", ht.ht.data_block_size);
 	printf("Hash block sz: %u\n", ht.ht.hash_block_size);
-	printf("Hash offset:   %lu\n", (unsigned long)ht.ht.tree_offset);
+	printf("Hash offset:   %" PRIu64 "\n", ht.ht.tree_offset);
 	printf("Root digest:   ");
 	print_hex(ht.root_digest, ht.ht.root_digest_len);
 	printf("\n");

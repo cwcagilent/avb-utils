@@ -193,9 +193,9 @@ The full on-disk hashtree layout: leaf hashes covering data blocks, intermediate
 
 1. `Locate the AVB footer`  checks the last 64 bytes first (standard
    location). If not found, detects the filesystem size from its superblock
-   (ext4, erofs, squashfs) and scans forward in 1 MiB chunks from the
-   filesystem boundary. This allows images signed with `--partition_size 0`
-   to work correctly when written to a larger block device.
+   (ext4, erofs, squashfs) and scans forward in 1 MiB chunks starting
+   1 MiB before the filesystem boundary. This allows images signed with
+   `--partition_size 0` to work correctly when written to a larger block device.
 2. `Verify vbmeta signature`  calls `avb_vbmeta_image_verify()` from libavb.
 3. `Check public key`  compares the key embedded in vbmeta against the
    trusted `pubkey.bin`.
@@ -255,6 +255,9 @@ trailing zeroes push the footer away from the device end. `avb_verify`
 handles this by detecting the filesystem type from its superblock and
 scanning forward from the filesystem boundary.
 
+Footer scans cover up to 2 GiB from the filesystem hint, with a fallback
+to the first 2 GiB. Images and devices larger than 4 GiB are supported.
+
 AVB footer fields:
 
 | Field | Size | Description |
@@ -279,8 +282,11 @@ ctest --test-dir build -V
 ```
 
 The test suite creates temporary ext4, erofs, and squashfs images, signs them,
-and exercises all code paths: signature verification, key mismatch, corruption
+and exercises signature verification, key mismatch, corruption
 detection, footer scanning on padded images, and root hash signature loading.
+
+Additional tests cover sparse images with footers beyond 4 GiB and malformed
+metadata. Loop-device and 32-bit tests run when available.
 
 ## License
 
