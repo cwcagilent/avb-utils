@@ -12,7 +12,7 @@ VERIFY="${avb_verify:-./build/avb_verify}"
 TEST_DIR=$(mktemp -d)
 trap 'rm -rf "$TEST_DIR"' EXIT
 
-for tool in openssl mkfs.ext4; do
+for tool in openssl mkfs.ext4 fec; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "ERROR: required tool '$tool' not found" >&2
         exit 1
