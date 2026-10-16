@@ -81,7 +81,21 @@ def main():
                         help="AVB signing algorithm (default: SHA256_RSA4096)")
     parser.add_argument("--avbtool", default=None,
                         help="Path to avbtool or avbtool.py (auto-detected if omitted)")
+    parser.add_argument("--fec-roots", type=int,
+                        default=int(os.environ.get("AVB_FEC_ROOTS") or 2),
+                        help="Reed-Solomon roots for dm-verity FEC, 2-24. Higher values "
+                             "repair more corrupt blocks at proportionally more space "
+                             "(default: 2, or $AVB_FEC_ROOTS)")
     args = parser.parse_args()
+
+    # dm-verity accepts 2..24 -- DM_VERITY_FEC_RSM minus MAX_RSN and MIN_RSN in
+    # drivers/md/dm-verity-fec.h. Neither avbtool nor the fec tool range-checks
+    # this, so without the guard an out-of-range value produces an image that
+    # builds cleanly and fails at dmsetup on the device.
+    if not 2 <= args.fec_roots <= 24:
+        print(f"Error: --fec-roots must be between 2 and 24, got {args.fec_roots}",
+              file=sys.stderr)
+        sys.exit(1)
 
     if not os.path.isfile(args.image):
         print(f"Error: image not found: {args.image}", file=sys.stderr)
@@ -129,6 +143,7 @@ def main():
             "--algorithm",      args.algorithm,
             "--key",            args.key,
             "--hash_algorithm", "sha256",
+            "--fec_num_roots",  str(args.fec_roots),
         ])
     else:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -195,6 +210,7 @@ def main():
                 "--key",            args.key,
                 "--hash_algorithm", "sha256",
                 "--salt",           salt,
+                "--fec_num_roots",  str(args.fec_roots),
                 "--prop_from_file", f"roothash_sig:{p7s_file}",
             ])
 
