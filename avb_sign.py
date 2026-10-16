@@ -129,14 +129,17 @@ def main():
             "--algorithm",      args.algorithm,
             "--key",            args.key,
             "--hash_algorithm", "sha256",
-            "--do_not_generate_fec",
         ])
     else:
         with tempfile.TemporaryDirectory() as tmpdir:
             roothash_file = os.path.join(tmpdir, "roothash.hex")
             p7s_file      = os.path.join(tmpdir, "roothash.p7s")
 
-            # Step 1: first-pass signing with avbtool picks a random salt
+            # Step 1: first-pass signing with avbtool picks a random salt.
+            # Step 4 erases this footer and rebuilds it, and the root digest
+            # covers the image data and salt rather than the parity, so there
+            # is nothing to gain from generating FEC that is about to be thrown
+            # away.
             print("[1/4] Adding hashtree footer (first pass)...")
             run(avb + [
                 "add_hashtree_footer",
@@ -192,7 +195,6 @@ def main():
                 "--key",            args.key,
                 "--hash_algorithm", "sha256",
                 "--salt",           salt,
-                "--do_not_generate_fec",
                 "--prop_from_file", f"roothash_sig:{p7s_file}",
             ])
 
