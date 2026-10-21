@@ -29,17 +29,27 @@ It implements two layers of verification:
 - [libavb](https://android.googlesource.com/platform/external/avb/) (submodule)
 - Python 3 + OpenSSL  for signing images with `avbtool` (development only)
 - [`fec`](https://android.googlesource.com/platform/system/extras/+/refs/heads/main/verity/fec/)
-  from AOSP `system/extras` on `PATH`  `avbtool` shells out to it to write
-  the dm-verity forward error correction data (development only)
+  from AOSP `system/extras`  `avbtool` shells out to it to write the
+  dm-verity forward error correction data (development only). Built here
+  from the submodules under `fec/` with `-DBUILD_FEC=ON` (implied by
+  `-DINSTALL_AVB_SIGN=ON`); that needs a C++20 compiler, OpenSSL and zlib
+  development files.
 
 > **Note:** `avb_verify` is lightweight: no external crypto library is required on the target and all cryptographic operations are handled by libavb's own built-in implementation. On the host side, `avb_sign.py` (via `avbtool`) handles dm-verity hash tree generation and vbmeta signing directly, so cryptsetup or any verity userspace tooling is not required.
 
 ## Build
 
 ```bash
+git submodule update --init
 cmake -B build
 cmake --build build
 ```
+
+For a host that signs images, add `-DINSTALL_AVB_SIGN=ON`: it installs
+`avb_sign`, `avbtool` and the `fec` tool they need. The AOSP repositories fec
+is assembled from are shallow submodules under `fec/`, so the init above
+fetches only the pinned commit of each; a target-only build can skip them
+with `git submodule update --init avb`.
 
 ## Signing (host)
 
@@ -324,3 +334,9 @@ from the Android Open Source Project used as a git submodule under `avb`.
 libavb is licensed under a permissive MIT-style license, the Apache License 2.0,
 and the BSD 3-Clause License depending on the source file:
 see the [upstream LICENSE](https://android.googlesource.com/platform/external/avb/+/refs/heads/master/LICENSE) for the full terms.
+
+The `fec` host tool is assembled from further AOSP repositories used as git
+submodules under `fec/`: `system/extras`, `system/libbase`, `system/core`,
+`system/logging` and `external/squashfs-tools`, all Apache License 2.0, and
+`external/fec` (Phil Karn's Reed-Solomon library), LGPL 2.1 or later. It is
+not installed on a target.
