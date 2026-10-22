@@ -7,23 +7,39 @@
 set -euo pipefail
 
 AVBTOOL="python3 avb/avbtool.py"
-SIGN="python3 avb_sign.py"
+SIGN_BASE="python3 avb_sign.py"
 VERIFY="${avb_verify:-./build/avb_verify}"
 TEST_DIR=$(mktemp -d)
 trap 'rm -rf "$TEST_DIR"' EXIT
 
-for tool in openssl mkfs.ext4 fec; do
+for tool in openssl mkfs.ext4; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "ERROR: required tool '$tool' not found" >&2
         exit 1
     fi
 done
 
+# fec is what avbtool shells out to for the parity avb_sign writes by default.
+# A tree built without BUILD_FEC has none, and that is a supported way to
+# sign -- with --no-fec -- so the suite runs that way and skips the one check
+# that needs parity to exist. SIGN_BASE is for the tests that pass --no-fec or
+# must not pass it themselves.
+if command -v fec >/dev/null 2>&1; then
+    HAVE_FEC=1
+    SIGN="$SIGN_BASE"
+else
+    HAVE_FEC=0
+    SIGN="$SIGN_BASE --no-fec"
+    echo "NOTE: no fec tool on PATH; signing with --no-fec, FEC checks skipped"
+fi
+
 pass=0
 fail=0
+skip=0
 
-ok()  { echo "  PASS  $1"; pass=$((pass + 1)); }
-nok() { echo "  FAIL  $1"; fail=$((fail + 1)); }
+ok()   { echo "  PASS  $1"; pass=$((pass + 1)); }
+nok()  { echo "  FAIL  $1"; fail=$((fail + 1)); }
+skip() { echo "  SKIP  $1"; skip=$((skip + 1)); }
 
 echo "=== Setting up test fixtures ==="
 
@@ -192,7 +208,9 @@ $SIGN --image "$TEST_DIR/rootfs.ext4" \
     && nok "nonexistent cert fails" || ok "nonexistent cert fails"
 
 # 17. the default signing writes FEC, and avb_verify names it in the table
-if $AVBTOOL info_image --image "$TEST_DIR/inplace.ext4" 2>/dev/null \
+if [[ $HAVE_FEC -eq 0 ]]; then
+    skip "default signing carries FEC (no fec tool)"
+elif $AVBTOOL info_image --image "$TEST_DIR/inplace.ext4" 2>/dev/null \
         | grep -q "FEC num roots:.*2" \
    && "$VERIFY" -t -d "$TEST_DIR/inplace.ext4" -k "$TEST_DIR/pubkey.bin" \
         2>/dev/null | grep -q "use_fec_from_device"; then
@@ -210,7 +228,7 @@ for tool in python3 openssl; do
     ln -s "$(command -v "$tool")" "$NOFEC_BIN/$tool"
 done
 cp "$TEST_DIR/rootfs.ext4" "$TEST_DIR/nofec.ext4"
-if env PATH="$NOFEC_BIN" $SIGN --image "$TEST_DIR/nofec.ext4" \
+if env PATH="$NOFEC_BIN" $SIGN_BASE --image "$TEST_DIR/nofec.ext4" \
          --key "$TEST_DIR/key.pem" \
          --cert "$TEST_DIR/sig_cert.pem" \
          --avbtool avb/avbtool.py \
@@ -242,7 +260,7 @@ fi
 
 # 18c. --no-fec without --cert takes the single-pass path
 cp "$TEST_DIR/rootfs.ext4" "$TEST_DIR/nofec-nosig.ext4"
-if env PATH="$NOFEC_BIN" $SIGN --image "$TEST_DIR/nofec-nosig.ext4" \
+if env PATH="$NOFEC_BIN" $SIGN_BASE --image "$TEST_DIR/nofec-nosig.ext4" \
          --key "$TEST_DIR/key.pem" \
          --avbtool avb/avbtool.py \
          --no-fec >/dev/null 2>&1 \
@@ -255,10 +273,10 @@ fi
 
 # 19. an out-of-range --fec-roots is refused, but not when --no-fec makes it moot
 cp "$TEST_DIR/rootfs.ext4" "$TEST_DIR/roots.ext4"
-$SIGN --image "$TEST_DIR/roots.ext4" --key "$TEST_DIR/key.pem" \
+$SIGN_BASE --image "$TEST_DIR/roots.ext4" --key "$TEST_DIR/key.pem" \
       --fec-roots 1 >/dev/null 2>&1 \
     && nok "--fec-roots 1 refused" || ok "--fec-roots 1 refused"
-if $SIGN --image "$TEST_DIR/roots.ext4" --key "$TEST_DIR/key.pem" \
+if $SIGN_BASE --image "$TEST_DIR/roots.ext4" --key "$TEST_DIR/key.pem" \
          --fec-roots 1 --no-fec >/dev/null 2>&1; then
     ok "--fec-roots ignored under --no-fec"
 else
@@ -266,5 +284,5 @@ else
 fi
 
 echo ""
-echo "=== Results: $pass passed, $fail failed ==="
+echo "=== Results: $pass passed, $fail failed, $skip skipped ==="
 exit "$fail"
