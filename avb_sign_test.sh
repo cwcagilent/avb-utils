@@ -191,6 +191,80 @@ $SIGN --image "$TEST_DIR/rootfs.ext4" \
       --cert "$TEST_DIR/no_cert.pem" >/dev/null 2>&1 \
     && nok "nonexistent cert fails" || ok "nonexistent cert fails"
 
+# 17. the default signing writes FEC, and avb_verify names it in the table
+if $AVBTOOL info_image --image "$TEST_DIR/inplace.ext4" 2>/dev/null \
+        | grep -q "FEC num roots:.*2" \
+   && "$VERIFY" -t -d "$TEST_DIR/inplace.ext4" -k "$TEST_DIR/pubkey.bin" \
+        2>/dev/null | grep -q "use_fec_from_device"; then
+    ok "default signing carries FEC"
+else
+    nok "default signing carries FEC"
+fi
+
+# 18. --no-fec signs with no fec tool reachable at all. A PATH holding only
+# what the script and avbtool themselves need, built from where those were
+# found, so a fec installed beside them cannot leak in.
+NOFEC_BIN="$TEST_DIR/nofec-bin"
+mkdir -p "$NOFEC_BIN"
+for tool in python3 openssl; do
+    ln -s "$(command -v "$tool")" "$NOFEC_BIN/$tool"
+done
+cp "$TEST_DIR/rootfs.ext4" "$TEST_DIR/nofec.ext4"
+if env PATH="$NOFEC_BIN" $SIGN --image "$TEST_DIR/nofec.ext4" \
+         --key "$TEST_DIR/key.pem" \
+         --cert "$TEST_DIR/sig_cert.pem" \
+         --avbtool avb/avbtool.py \
+         --no-fec >/dev/null 2>&1; then
+    ok "--no-fec signs without a fec tool"
+else
+    nok "--no-fec signs without a fec tool"
+fi
+
+# 18a. the --no-fec image carries no FEC and the table has no FEC arguments
+if $AVBTOOL info_image --image "$TEST_DIR/nofec.ext4" 2>/dev/null \
+        | grep -q "FEC num roots:.*0" \
+   && ! "$VERIFY" -t -d "$TEST_DIR/nofec.ext4" -k "$TEST_DIR/pubkey.bin" \
+        2>/dev/null | grep -q "use_fec_from_device"; then
+    ok "--no-fec image has no FEC"
+else
+    nok "--no-fec image has no FEC"
+fi
+
+# 18b. and it still verifies, with its roothash_sig
+if "$VERIFY" -d "$TEST_DIR/nofec.ext4" -k "$TEST_DIR/pubkey.bin" \
+        2>/dev/null | grep -q "Verification:  OK" \
+   && $AVBTOOL info_image --image "$TEST_DIR/nofec.ext4" 2>/dev/null \
+        | grep -q "roothash_sig"; then
+    ok "--no-fec image verifies"
+else
+    nok "--no-fec image verifies"
+fi
+
+# 18c. --no-fec without --cert takes the single-pass path
+cp "$TEST_DIR/rootfs.ext4" "$TEST_DIR/nofec-nosig.ext4"
+if env PATH="$NOFEC_BIN" $SIGN --image "$TEST_DIR/nofec-nosig.ext4" \
+         --key "$TEST_DIR/key.pem" \
+         --avbtool avb/avbtool.py \
+         --no-fec >/dev/null 2>&1 \
+   && "$VERIFY" -d "$TEST_DIR/nofec-nosig.ext4" -k "$TEST_DIR/pubkey.bin" \
+        2>/dev/null | grep -q "Verification:  OK"; then
+    ok "--no-fec without --cert"
+else
+    nok "--no-fec without --cert"
+fi
+
+# 19. an out-of-range --fec-roots is refused, but not when --no-fec makes it moot
+cp "$TEST_DIR/rootfs.ext4" "$TEST_DIR/roots.ext4"
+$SIGN --image "$TEST_DIR/roots.ext4" --key "$TEST_DIR/key.pem" \
+      --fec-roots 1 >/dev/null 2>&1 \
+    && nok "--fec-roots 1 refused" || ok "--fec-roots 1 refused"
+if $SIGN --image "$TEST_DIR/roots.ext4" --key "$TEST_DIR/key.pem" \
+         --fec-roots 1 --no-fec >/dev/null 2>&1; then
+    ok "--fec-roots ignored under --no-fec"
+else
+    nok "--fec-roots ignored under --no-fec"
+fi
+
 echo ""
 echo "=== Results: $pass passed, $fail failed ==="
 exit "$fail"

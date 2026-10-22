@@ -33,7 +33,7 @@ It implements two layers of verification:
   dm-verity forward error correction data (development only). Built here
   from the submodules under `fec/` with `-DBUILD_FEC=ON` (implied by
   `-DINSTALL_AVB_SIGN=ON`); that needs a C++20 compiler, OpenSSL and zlib
-  development files.
+  development files. Not needed to sign with `--no-fec`.
 
 > **Note:** `avb_verify` is lightweight: no external crypto library is required on the target and all cryptographic operations are handled by libavb's own built-in implementation. On the host side, `avb_sign.py` (via `avbtool`) handles dm-verity hash tree generation and vbmeta signing directly, so cryptsetup or any verity userspace tooling is not required.
 
@@ -103,17 +103,31 @@ python3 avb_sign.py \
 
 ### 3. Forward error correction
 
-`avb_sign.py` always writes a Reed-Solomon parity area after the hash tree, and
-`avb_verify` emits the matching `use_fec_from_device` arguments in the dm-verity
-table, so the kernel repairs a bounded number of corrupt blocks instead of
-failing the read. `--fec-roots` sets the number of roots, 2 to 24 (the range
-dm-verity accepts); it defaults to `$AVB_FEC_ROOTS`, or 2. Each 255-byte
-codeword corrects up to `roots / 2` bad bytes, at a space cost of
+By default `avb_sign.py` writes a Reed-Solomon parity area after the hash tree,
+and `avb_verify` emits the matching `use_fec_from_device` arguments in the
+dm-verity table, so the kernel repairs a bounded number of corrupt blocks
+instead of failing the read. `--fec-roots` sets the number of roots, 2 to 24
+(the range dm-verity accepts); it defaults to `$AVB_FEC_ROOTS`, or 2. Each
+255-byte codeword corrects up to `roots / 2` bad bytes, at a space cost of
 `roots / (255 - roots)` of the covered data, so 2 roots repairs one corrupt
 4 KiB block per interleave group for 0.8 %, and 24 repairs twelve for 10.4 %.
 
+These are AOSP's defaults: `avbtool add_hashtree_footer` generates FEC unless
+told `--do_not_generate_fec`, with `--fec_num_roots` defaulting to 2, and
+`--no-fec` here maps onto that switch. An image signed with the defaults is
+therefore laid out the same way one signed by a stock `avbtool` would be.
+
 ```bash
 python3 avb_sign.py --image rootfs.ext4 --key key.pem --fec-roots 24
+```
+
+`--no-fec` writes no parity. The image then needs no `fec` tool to sign -- a
+host built with `-DBUILD_FEC=OFF` can still sign -- and dm-verity fails a
+corrupt block instead of repairing it. `avb_verify` reads either kind: the
+`use_fec_from_device` group is only emitted for an image that carries FEC.
+
+```bash
+python3 avb_sign.py --image rootfs.ext4 --key key.pem --no-fec
 ```
 
 ### 4. Extract the public key for the target
